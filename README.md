@@ -7,11 +7,13 @@ The script does **not** create live battlefield marks. The crew exposes “film�
 ## Concept
 
 1. F-4E carries the AN/ASQ-T50 TCTS ACMI pod as the visual recon/recording store.
-2. Pilot or WSO uses the F10 menu command: `Phantom Recon > Expose Recon Film`.
-3. Script scans a radius around the aircraft, default `3 NM`.
+2. Pilot or WSO exposes film from the F10 menu: a single frame (`Expose Recon Film`) or a continuous `Camera Run ON/OFF`.
+3. Each frame records a ground footprint around the aircraft, default `3 NM` radius, regardless of altitude.
 4. Detected vehicles and statics are stored silently.
 5. Aircraft lands and stops taxiing.
 6. After `5 minutes`, the stored contacts appear as coalition F10 map marks.
+
+If the aircraft is shot down, crashes, or the crew ejects, the film is lost with it.
 
 This gives the Phantom a believable reconnaissance loop:
 
@@ -60,7 +62,9 @@ MISSION START → DO SCRIPT FILE → F4E_Phantom_Recon.lua
 6. Use:
 
 ```text
-F10 → Other → Phantom Recon → Expose Recon Film
+F10 → Other → Phantom Recon → Expose Recon Film   (single frame, 20 s cooldown)
+F10 → Other → Phantom Recon → Camera Run ON/OFF   (one frame every 2 s while in envelope)
+F10 → Other → Phantom Recon → Film Status         (frames left, processing timer)
 ```
 
 ## Default recon envelope
@@ -74,6 +78,9 @@ The aircraft must be airborne and inside this envelope:
 | Maximum altitude | 12,000 ft AGL |
 | Minimum speed | 300 kt |
 | Maximum speed | 620 kt |
+| Maximum bank angle | 30° |
+| Film magazine | 60 frames |
+| Camera run frame interval | 2 sec |
 | Photo cooldown | 20 sec |
 | Film processing delay | 5 min |
 | Stopped speed threshold | 2 kt |
@@ -134,6 +141,20 @@ unitMarkMode = "object"
 
 Static objects are always marked individually.
 
+## Film magazine and camera runs
+
+```lua
+film = {
+    frames = 60,                -- frames per sortie; 0 = unlimited
+    cameraRunIntervalSec = 2,   -- one frame every N seconds while camera run is ON
+    loseFilmWithAircraft = true -- film is destroyed on crash/death/ejection
+},
+```
+
+A camera run only exposes frames while the aircraft is inside the envelope (altitude, speed, bank), so you can switch it on before the target and fly through. When the magazine is empty, the run stops automatically. The magazine is reloaded after processing, or on landing if nothing of interest was recorded.
+
+Each physical vehicle is counted only once per sortie, however many frames it appears in.
+
 ## Recovery behavior
 
 Default behavior allows processing anywhere the aircraft is landed and stopped:
@@ -179,6 +200,8 @@ If the aircraft starts moving again before the timer completes, the timer resets
 mustRemainStopped = true
 ```
 
+If the crew leaves the aircraft after processing has started, the film is handed to the ground crew and processing finishes without the jet (`handOffOnLeave = true`).
+
 ## Map marks
 
 After processing, the script creates coalition F10 marks like:
@@ -190,6 +213,7 @@ Type: T-72B
 Count: 4
 Observed side: RED
 Source: F-4E / AN-ASQ-T50 recce abstraction
+Photographed: 14:21
 Processed: 14:32
 Accuracy: approx +/- 100 m
 ```
@@ -198,6 +222,8 @@ The marks include a configurable random offset:
 
 ```lua
 markAccuracyMeters = 100
+replaceOldMarks = true      -- a newer photo of the same contact replaces its old mark
+markLifetimeSec = 0         -- auto-remove marks after N seconds; 0 = never
 ```
 
 Set it to `0` for exact marks.
