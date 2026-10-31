@@ -65,6 +65,7 @@ MISSION START → DO SCRIPT FILE → F4E_Phantom_Recon.lua
 F10 → Other → Phantom Recon → Expose Recon Film   (single frame, 20 s cooldown)
 F10 → Other → Phantom Recon → Camera Run ON/OFF   (one frame every 2 s while in envelope)
 F10 → Other → Phantom Recon → Film Status         (frames left, processing timer)
+F10 → Other → Phantom Recon → Last Recon Report   (re-show the latest coalition report)
 ```
 
 ## Default recon envelope
@@ -155,6 +156,44 @@ A camera run only exposes frames while the aircraft is inside the envelope (alti
 
 Each physical vehicle is counted only once per sortie, however many frames it appears in.
 
+## Photo quality by altitude
+
+The lower the pass, the more the photo interpreters can tell. Each contact keeps the best quality it was photographed at during the sortie.
+
+| AGL | Quality | Mark shows | Accuracy | Threat ring |
+|---|---|---|---:|:---:|
+| ≤ 3,000 ft | GOOD | Class and exact type (`Armour: T-72B`), exact count | ±50 m | yes |
+| ≤ 7,000 ft | FAIR | Class only (`Armour`, `Air defence`, `Mechanised`, `Artillery`, `Soft-skin`), count range (`3-5`) | ±150 m | yes |
+| above | POOR | `Vehicles`, count unknown | ±300 m | no |
+
+Tiers are configurable under `detail.tiers`. Set `detail.enabled = false` to always show full detail with `markAccuracyMeters`.
+
+## Air defence threat rings
+
+Identified SAM and AAA sites get a red circle on the F10 map, sized by DCS unit attribute:
+
+| Attribute | Radius |
+|---|---:|
+| LR SAM | 45 km |
+| MR SAM | 25 km |
+| SR SAM | 10 km |
+| AAA | 3 km |
+
+Override specific types with `threatRings.byType`, e.g. `["Kub 1S91 str"] = 24000`. Rings are replaced and expire together with their mark.
+
+## Recon report
+
+When film is processed, the whole coalition gets a text report with the air defence threats listed first and MGRS grids:
+
+```text
+RECON REPORT - Pontiac 1 - processed 14:32
+1. Air defence: Kub 1S91 str x1 @ 38T KM 12345 67890 (GOOD) THREAT
+2. Armour: T-72B x4 @ 38T KM 12410 67955 (GOOD)
+3. Soft-skin x3-5 @ 38T KM 13020 68110 (FAIR)
+```
+
+Grids are taken from the mark position, so they include the same accuracy offset. Anyone in an F-4E can re-show it with `Last Recon Report`.
+
 ## Recovery behavior
 
 Default behavior allows processing anywhere the aircraft is landed and stopped:
@@ -208,14 +247,14 @@ After processing, the script creates coalition F10 marks like:
 
 ```text
 RECCE PHOTO CONTACT
-Class: Vehicle group
-Type: T-72B
+Contact: Armour: T-72B
 Count: 4
 Observed side: RED
+Photo quality: GOOD
 Source: F-4E / AN-ASQ-T50 recce abstraction
 Photographed: 14:21
 Processed: 14:32
-Accuracy: approx +/- 100 m
+Accuracy: approx +/- 50 m
 ```
 
 The marks include a configurable random offset:

@@ -78,7 +78,47 @@ F4Recon.config = {
     maxContactsPerPhotoRun = 80,    -- max new contacts per frame (anti-confetti)
     markReadOnly = true,
     replaceOldMarks = true,         -- newer photos of a contact replace its old mark
-    markLifetimeSec = 0,            -- remove marks after N seconds; 0 = never
+    markLifetimeSec = 0,            -- remove marks and rings after N seconds; 0 = never
+
+    -- Photo interpretation quality by altitude. A contact keeps the best
+    -- (lowest) tier it was photographed at during the sortie. First match wins.
+    --   showType    = exact vehicle type(s) instead of a class like "Armour"
+    --   showClass   = class like "Armour"/"Air defence"; false = just "Vehicles"
+    --   countMode   = "exact", "approx" (range like 3-5) or "none"
+    --   accuracyM   = random mark offset for this tier
+    --   threatRing  = allow SAM/AAA threat rings from this tier
+    detail = {
+        enabled = true,
+        tiers = {
+            { maxAglFt = 3000,  name = "GOOD", showType = true,  showClass = true,  countMode = "exact",  accuracyM = 50,  threatRing = true },
+            { maxAglFt = 7000,  name = "FAIR", showType = false, showClass = true,  countMode = "approx", accuracyM = 150, threatRing = true },
+            { maxAglFt = 99999, name = "POOR", showType = false, showClass = false, countMode = "none",   accuracyM = 300, threatRing = false },
+        },
+    },
+
+    -- Air defence threat rings drawn on the F10 map for identified SAM/AAA.
+    threatRings = {
+        enabled = true,
+        -- Radius by DCS unit attribute, checked in this order (meters).
+        byAttribute = {
+            { attr = "LR SAM", radiusM = 45000 },
+            { attr = "MR SAM", radiusM = 25000 },
+            { attr = "SR SAM", radiusM = 10000 },
+            { attr = "AAA",    radiusM = 3000 },
+        },
+        -- Optional exact overrides by unit type name, e.g. ["Kub 1S91 str"] = 24000
+        byType = {},
+        lineColor = { 1, 0, 0, 0.9 },
+        fillColor = { 1, 0, 0, 0.10 },
+        lineType = 1,
+    },
+
+    -- Text recon report shown to the coalition when film is processed.
+    report = {
+        enabled = true,
+        maxLines = 15,
+        displaySec = 60,
+    },
 
     -- AN/ASQ-T50 ACMI pod check.
     -- mode values:
@@ -128,7 +168,19 @@ F4Recon.MPS_TO_KT = 1.943844492
 F4Recon.nextMarkId = F4Recon.nextMarkId or F4Recon.config.firstMarkId
 F4Recon.groupState = F4Recon.groupState or {}
 F4Recon.menuAdded = F4Recon.menuAdded or {}
-F4Recon.markRegistry = F4Recon.markRegistry or {}  -- [coalition..key] = markId
+F4Recon.markRegistry = F4Recon.markRegistry or {}  -- [coalition..key] = { mark=id, ring=id }
+F4Recon.lastReport = F4Recon.lastReport or {}      -- [coalitionId] = report text
+
+-- Contact classes, lower priority = listed first in reports.
+F4Recon.CLASSES = {
+    { name = "Air defence", priority = 1, attrs = { "LR SAM", "MR SAM", "SR SAM", "SAM SR", "SAM TR", "AAA", "Air Defence" } },
+    { name = "Armour",      priority = 2, attrs = { "Tanks" } },
+    { name = "Mechanised",  priority = 3, attrs = { "IFV", "APC" } },
+    { name = "Artillery",   priority = 4, attrs = { "Artillery", "MLRS" } },
+    { name = "Soft-skin",   priority = 5, attrs = { "Trucks", "Unarmed vehicles", "Cars" } },
+}
+F4Recon.DEFAULT_CLASS = { name = "Vehicle", priority = 6 }
+F4Recon.STATIC_CLASS = { name = "Static object", priority = 7 }
 
 -- ---------------------------------------------------------------------------
 -- Utility
@@ -406,6 +458,61 @@ function F4Recon.hasLineOfSight(fromUnit, targetPoint)
     return land.isVisible(aircraftPoint, target)
 end
 
+function F4Recon.unitHasAttr(unit, attr)
+    return F4Recon.safeCall(function() return unit:hasAttribute(attr) end, false) == true
+end
+
+function F4Recon.classifyUnit(unit)
+    for _, class in ipairs(F4Recon.CLASSES) do
+        for _, attr in ipairs(class.attrs) do
+            if F4Recon.unitHasAttr(unit, attr) then
+                return class
+            end
+        end
+    end
+    return F4Recon.DEFAULT_CLASS
+end
+
+-- Threat radius in meters for SAM/AAA units, or 0.
+function F4Recon.threatRadiusOf(unit)
+    local cfg = F4Recon.config.threatRings
+    if not cfg or not cfg.enabled then
+        return 0
+    end
+
+    local typeName = unit:getTypeName() or ""
+    if cfg.byType and cfg.byType[typeName] then
+        return cfg.byType[typeName]
+    end
+
+    for _, entry in ipairs(cfg.byAttribute or {}) do
+        if F4Recon.unitHasAttr(unit, entry.attr) then
+            return entry.radiusM
+        end
+    end
+    return 0
+end
+
+-- Tier index (1 = best) for a given AGL.
+function F4Recon.tierIndexForAgl(aglFt)
+    local tiers = F4Recon.config.detail.tiers
+    for i, tier in ipairs(tiers) do
+        if aglFt <= tier.maxAglFt then
+            return i
+        end
+    end
+    return #tiers
+end
+
+function F4Recon.getTier(contact)
+    local detail = F4Recon.config.detail
+    if not detail or not detail.enabled then
+        return { name = "N/A", showType = true, showClass = true, countMode = "exact",
+                 accuracyM = F4Recon.config.markAccuracyMeters, threatRing = true }
+    end
+    return detail.tiers[contact.tier or #detail.tiers]
+end
+
 function F4Recon.makeContactFromUnit(unit, photoClock)
     local point = unit:getPoint()
     local group = unit:getGroup()
@@ -439,6 +546,8 @@ function F4Recon.makeContactFromUnit(unit, photoClock)
         point = { x = point.x, y = point.y, z = point.z },
         count = 1,
         photoClock = photoClock,
+        class = F4Recon.classifyUnit(unit),
+        threatRadiusM = F4Recon.threatRadiusOf(unit),
     }
 end
 
@@ -458,6 +567,8 @@ function F4Recon.makeContactFromStatic(staticObj, photoClock)
         point = { x = point.x, y = point.y, z = point.z },
         count = 1,
         photoClock = photoClock,
+        class = F4Recon.STATIC_CLASS,
+        threatRadiusM = 0,
     }
 end
 
@@ -468,6 +579,17 @@ function F4Recon.storeContact(state, contact)
 
     if existing then
         existing.photoClock = contact.photoClock
+
+        -- Keep the best photo quality and the most significant class/threat.
+        if contact.tier and (not existing.tier or contact.tier < existing.tier) then
+            existing.tier = contact.tier
+        end
+        if contact.class and contact.class.priority < existing.class.priority then
+            existing.class = contact.class
+        end
+        if (contact.threatRadiusM or 0) > (existing.threatRadiusM or 0) then
+            existing.threatRadiusM = contact.threatRadiusM
+        end
 
         if existing.members[contact.memberName] then
             return false
@@ -509,7 +631,13 @@ function F4Recon.scanAroundAircraft(unit, state)
     local searchRadius = math.sqrt(radiusM * radiusM + aglM * aglM)
     local reconCoalition = unit:getCoalition()
     local photoClock = F4Recon.missionClock()
+    local tier = F4Recon.tierIndexForAgl(F4Recon.getAglFt(unit))
     local added = 0
+
+    local function store(contact)
+        contact.tier = tier
+        return F4Recon.storeContact(state, contact)
+    end
 
     local volume = {
         id = world.VolumeType.SPHERE,
@@ -535,7 +663,7 @@ function F4Recon.scanAroundAircraft(unit, state)
                 if inside
                     and F4Recon.shouldDetectCoalition(obj:getCoalition(), reconCoalition)
                     and F4Recon.hasLineOfSight(unit, p) then
-                    if F4Recon.storeContact(state, F4Recon.makeContactFromUnit(obj, photoClock)) then
+                    if store(F4Recon.makeContactFromUnit(obj, photoClock)) then
                         added = added + 1
                     end
                 end
@@ -558,7 +686,7 @@ function F4Recon.scanAroundAircraft(unit, state)
                 if inside
                     and F4Recon.shouldDetectCoalition(objectCoalition, reconCoalition)
                     and F4Recon.hasLineOfSight(unit, p) then
-                    if F4Recon.storeContact(state, F4Recon.makeContactFromStatic(obj, photoClock)) then
+                    if store(F4Recon.makeContactFromStatic(obj, photoClock)) then
                         added = added + 1
                     end
                 end
@@ -871,32 +999,99 @@ function F4Recon.describeType(contact)
     return "Mixed (" .. table.concat(names, ", ") .. ")"
 end
 
+function F4Recon.describeCount(contact, tier)
+    local n = contact.count or 1
+    if tier.countMode == "exact" then
+        return tostring(n)
+    elseif tier.countMode == "approx" then
+        if n <= 2 then return "1-2"
+        elseif n <= 5 then return "3-5"
+        elseif n <= 10 then return "6-10"
+        end
+        return "10+"
+    end
+    return "unknown"
+end
+
+-- What the photo interpreters can say about a contact at its photo quality.
+function F4Recon.describeContact(contact)
+    local tier = F4Recon.getTier(contact)
+    local what
+
+    if contact.category == "STATIC" then
+        what = tier.showType and contact.typeName or "Structure / static object"
+    elseif tier.showType then
+        what = F4Recon.describeType(contact)
+        if contact.class and contact.class ~= F4Recon.DEFAULT_CLASS then
+            what = contact.class.name .. ": " .. what
+        end
+    elseif tier.showClass and contact.class then
+        what = contact.class.name
+    else
+        what = "Vehicles"
+    end
+
+    return {
+        what = what,
+        count = F4Recon.describeCount(contact, tier),
+        quality = tier.name,
+        accuracyM = tier.accuracyM or F4Recon.config.markAccuracyMeters or 0,
+        showRing = tier.threatRing and (contact.threatRadiusM or 0) > 0,
+    }
+end
+
+function F4Recon.toMgrs(point)
+    return F4Recon.safeCall(function()
+        local lat, lon = coord.LOtoLL(point)
+        local m = coord.LLtoMGRS(lat, lon)
+        return string.format("%s %s %05d %05d", m.UTMZone, m.MGRSDigraph,
+            math.floor(m.Easting), math.floor(m.Northing))
+    end, "n/a")
+end
+
+function F4Recon.removeRegistered(registryKey)
+    local entry = F4Recon.markRegistry[registryKey]
+    if not entry then
+        return
+    end
+    for _, id in pairs(entry) do
+        F4Recon.safeCall(function() trigger.action.removeMark(id) end, nil)
+    end
+    F4Recon.markRegistry[registryKey] = nil
+end
+
+-- Creates the F10 mark (and threat ring) for a contact. Returns the
+-- description and mark point, which the recon report reuses.
 function F4Recon.createMapMark(coalitionId, contact, sourceGroupName)
     local cfg = F4Recon.config
     local registryKey = tostring(coalitionId) .. "|" .. contact.key
 
-    if cfg.replaceOldMarks and F4Recon.markRegistry[registryKey] then
-        local oldId = F4Recon.markRegistry[registryKey]
-        F4Recon.safeCall(function() trigger.action.removeMark(oldId) end, nil)
-        F4Recon.markRegistry[registryKey] = nil
+    if cfg.replaceOldMarks then
+        F4Recon.removeRegistered(registryKey)
     end
+
+    local d = F4Recon.describeContact(contact)
+    local point = F4Recon.randomOffsetPoint(contact.point, d.accuracyM)
 
     F4Recon.nextMarkId = F4Recon.nextMarkId + 1
     local markId = F4Recon.nextMarkId
-
-    local point = F4Recon.randomOffsetPoint(contact.point, cfg.markAccuracyMeters)
-    local accuracy = cfg.markAccuracyMeters or 0
+    local entry = { mark = markId }
 
     local text =
         "RECCE PHOTO CONTACT\n" ..
-        "Class: " .. contact.label .. "\n" ..
-        "Type: " .. F4Recon.describeType(contact) .. "\n" ..
-        "Count: " .. tostring(contact.count or 1) .. "\n" ..
+        "Contact: " .. d.what .. "\n" ..
+        "Count: " .. d.count .. "\n" ..
         "Observed side: " .. F4Recon.getCoalitionName(contact.coalitionId) .. "\n" ..
+        "Photo quality: " .. d.quality .. "\n" ..
         "Source: F-4E / AN-ASQ-T50 recce abstraction\n" ..
         "Photographed: " .. (contact.photoClock or "unknown") .. "\n" ..
         "Processed: " .. F4Recon.missionClock() .. "\n" ..
-        "Accuracy: approx +/- " .. tostring(accuracy) .. " m"
+        "Accuracy: approx +/- " .. tostring(d.accuracyM) .. " m"
+
+    if d.showRing then
+        text = text .. "\nThreat radius: approx " ..
+            string.format("%.0f", contact.threatRadiusM / F4Recon.NM_TO_M) .. " NM"
+    end
 
     trigger.action.markToCoalition(
         markId,
@@ -907,39 +1102,104 @@ function F4Recon.createMapMark(coalitionId, contact, sourceGroupName)
         "Recon intel added from " .. (sourceGroupName or "F-4E")
     )
 
-    F4Recon.markRegistry[registryKey] = markId
+    if d.showRing and cfg.threatRings.enabled and trigger.action.circleToAll then
+        F4Recon.nextMarkId = F4Recon.nextMarkId + 1
+        entry.ring = F4Recon.nextMarkId
+        local rc = cfg.threatRings
+        F4Recon.safeCall(function()
+            trigger.action.circleToAll(coalitionId, entry.ring, point, contact.threatRadiusM,
+                rc.lineColor, rc.fillColor, rc.lineType, cfg.markReadOnly, "")
+        end, nil)
+    end
+
+    F4Recon.markRegistry[registryKey] = entry
 
     if cfg.markLifetimeSec and cfg.markLifetimeSec > 0 then
         timer.scheduleFunction(function()
-            if F4Recon.markRegistry[registryKey] == markId then
-                F4Recon.markRegistry[registryKey] = nil
+            if F4Recon.markRegistry[registryKey] == entry then
+                F4Recon.removeRegistered(registryKey)
             end
-            F4Recon.safeCall(function() trigger.action.removeMark(markId) end, nil)
             return nil
         end, nil, timer.getTime() + cfg.markLifetimeSec)
     end
+
+    d.point = point
+    return d
+end
+
+function F4Recon.buildReport(state, entries)
+    local cfg = F4Recon.config.report
+    table.sort(entries, function(a, b)
+        if a.priority ~= b.priority then
+            return a.priority < b.priority
+        end
+        return a.order < b.order
+    end)
+
+    local lines = {
+        "RECON REPORT - " .. tostring(state.groupName or "F-4E") ..
+        " - processed " .. F4Recon.missionClock(),
+    }
+
+    if #entries == 0 then
+        lines[#lines + 1] = "Nothing of interest recorded."
+    end
+
+    for i, e in ipairs(entries) do
+        if i > (cfg.maxLines or 15) then
+            lines[#lines + 1] = "... +" .. (#entries - i + 1) .. " more on F10 map"
+            break
+        end
+        local line = i .. ". " .. e.d.what .. " x" .. e.d.count ..
+            " @ " .. F4Recon.toMgrs(e.d.point) .. " (" .. e.d.quality .. ")"
+        if e.d.showRing then
+            line = line .. " THREAT"
+        end
+        lines[#lines + 1] = line
+    end
+
+    return table.concat(lines, "\n")
 end
 
 function F4Recon.processFilm(groupId, state)
     local coalitionId = state.coalitionId or coalition.side.BLUE
-    local marked = 0
+    local entries = {}
 
-    for _, key in ipairs(state.contactOrder) do
+    for i, key in ipairs(state.contactOrder) do
         local contact = state.contacts[key]
         if contact then
-            F4Recon.createMapMark(coalitionId, contact, state.groupName)
-            marked = marked + 1
+            local d = F4Recon.createMapMark(coalitionId, contact, state.groupName)
+            entries[#entries + 1] = {
+                d = d,
+                order = i,
+                priority = contact.class and contact.class.priority or 99,
+            }
         end
     end
 
-    F4Recon.outCoalition(
-        coalitionId,
-        "Recon film processed. " .. marked .. " contact mark(s) added to F10 map.",
-        15
-    )
+    local reportCfg = F4Recon.config.report
+    if reportCfg and reportCfg.enabled then
+        local report = F4Recon.buildReport(state, entries)
+        F4Recon.lastReport[coalitionId] = report
+        F4Recon.outCoalition(coalitionId, report, reportCfg.displaySec or 60)
+    else
+        F4Recon.outCoalition(
+            coalitionId,
+            "Recon film processed. " .. #entries .. " contact mark(s) added to F10 map.",
+            15
+        )
+    end
 
-    env.info("F4Recon: processed " .. marked .. " contacts for group " .. tostring(state.groupName or groupId))
+    env.info("F4Recon: processed " .. #entries .. " contacts for group " .. tostring(state.groupName or groupId))
     F4Recon.resetFilm(state, true)
+end
+
+function F4Recon.showLastReport(groupId)
+    local state = F4Recon.getState(groupId)
+    local unit = F4Recon.getPlayerUnitByGroupId(groupId)
+    local coalitionId = (unit and unit:getCoalition()) or state.coalitionId
+    local report = coalitionId and F4Recon.lastReport[coalitionId]
+    F4Recon.outGroup(groupId, report or "No recon report available yet.", 45)
 end
 
 -- Landed with exposed frames but nothing recorded: just reload the magazine.
@@ -1113,6 +1373,7 @@ function F4Recon.registerMenus(_, now)
                         missionCommands.addCommandForGroup(groupId, "Expose Recon Film", root, F4Recon.takePhoto, groupId)
                         missionCommands.addCommandForGroup(groupId, "Camera Run ON/OFF", root, F4Recon.toggleCameraRun, groupId)
                         missionCommands.addCommandForGroup(groupId, "Film Status", root, F4Recon.showFilmStatus, groupId)
+                        missionCommands.addCommandForGroup(groupId, "Last Recon Report", root, F4Recon.showLastReport, groupId)
 
                         F4Recon.menuAdded[groupId] = true
                         F4Recon.outGroup(
